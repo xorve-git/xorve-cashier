@@ -2,48 +2,37 @@
 
 namespace Acelle\Cashier\Services;
 
+use Illuminate\Support\Facades\Log;
 use Acelle\Library\Contracts\PaymentGatewayInterface;
-use Acelle\Cashier\Cashier;
 use Carbon\Carbon;
+use Acelle\Cashier\Cashier;
+use Acelle\Library\AutoBillingData;
 use Acelle\Model\Invoice;
 use Acelle\Library\TransactionResult;
 use Acelle\Model\Transaction;
 
-class BraintreePaymentGateway implements PaymentGatewayInterface
+class PaystackPaymentGateway implements PaymentGatewayInterface
 {
-    public $environment;
-    public $merchantId;
     public $publicKey;
-    public $privateKey;
-    public $serviceGateway;
+    public $secretKey;
     public $active=false;
 
-    public const TYPE = 'braintree';
+    public const TYPE = 'paystack';
 
-    public function __construct($environment, $merchantId, $publicKey, $privateKey)
+    /**
+     * Construction
+     */
+    public function __construct($publicKey, $secretKey)
     {
-        $this->environment = $environment;
-        $this->merchantId = $merchantId;
         $this->publicKey = $publicKey;
-        $this->privateKey = $privateKey;
+        $this->secretKey = $secretKey;
 
         $this->validate();
-
-        if ($this->isActive()) {
-            $this->serviceGateway = new \Braintree_Gateway([
-                'environment' => $environment,
-                'merchantId' => (isset($merchantId) ? $merchantId : 'noname'),
-                'publicKey' => (isset($publicKey) ? $publicKey : 'noname'),
-                'privateKey' => (isset($privateKey) ? $privateKey : 'noname'),
-            ]);
-        }
-
-        \Carbon\Carbon::setToStringFormat('jS \o\f F');
     }
 
     public function getName() : string
     {
-        return trans('cashier::messages.braintree');
+        return trans('cashier::messages.paystack');
     }
 
     public function getType() : string
@@ -53,22 +42,22 @@ class BraintreePaymentGateway implements PaymentGatewayInterface
 
     public function getDescription() : string
     {
-        return trans('cashier::messages.braintree.description');
+        return trans('cashier::messages.paystack.description');
     }
 
     public function getShortDescription() : string
     {
-        return trans('cashier::messages.braintree.short_description');
+        return trans('cashier::messages.paystack.short_description');
     }
 
     public function getSettingsUrl() : string
     {
-        return action("\Acelle\Cashier\Controllers\BraintreeController@settings");
+        return action("\Acelle\Cashier\Controllers\PaystackController@settings");
     }
 
     public function validate()
     {
-        if (!$this->environment || !$this->merchantId || !$this->privateKey || !$this->publicKey) {
+        if (!$this->publicKey || !$this->secretKey) {
             $this->active = false;
         } else {
             $this->active = true;
@@ -78,55 +67,6 @@ class BraintreePaymentGateway implements PaymentGatewayInterface
     public function isActive() : bool
     {
         return $this->active;
-    }
-
-    public function verify(Transaction $transaction) : TransactionResult
-    {
-        throw new \Exception("Payment service {$this->getType()} should not have pending transaction to verify");
-    }
-
-    public function allowManualReviewingOfTransaction() : bool
-    {
-        return false;
-    }
-
-    /**
-     * Check invoice for paying.
-     *
-     * @return void
-     */
-    public function autoCharge($invoice)
-    {
-        $invoice->checkout($this, function($invoice) {
-            $autoBillingData = $invoice->customer->getAutoBillingData();
-
-            try {
-                // charge invoice
-                $this->doCharge([
-                    'paymentMethodToken' => $autoBillingData->getData()['paymentMethodToken'],
-                    'amount' => $invoice->total(),
-                    'currency' => $invoice->getCurrencyCode(),
-                    'description' => trans('messages.pay_invoice', [
-                        'id' => $invoice->uid,
-                    ]),
-                ]);
-
-                return new TransactionResult(TransactionResult::RESULT_DONE);
-            } catch (\Throwable $e) {
-                $authPaymentLink = action("\Acelle\Cashier\Controllers\BraintreeController@checkout", [
-                    'invoice_uid' => $invoice->uid,
-                ]);
-
-                return new TransactionResult(
-                    TransactionResult::RESULT_FAILED,
-                    $e->getMessage() . ' ' . trans('cashier::messages.braintree.click_to_auth', [
-                        'link' => $authPaymentLink,
-                    ])
-                );
-                
-                return new TransactionResult(TransactionResult::RESULT_FAILED, $e->getMessage());
-            }
-        });
     }
 
     public function getEnvironment()
@@ -149,141 +89,6 @@ class BraintreePaymentGateway implements PaymentGatewayInterface
         return $this->privateKey;
     }
 
-    /**
-     * Check if service is valid.
-     *
-     * @return void
-     */
-    public function test()
-    {
-        try {
-            $clientToken = $this->serviceGateway->clientToken()->generate([
-                "customerId" => '123'
-            ]);
-        } catch (\Braintree_Exception_Authentication $e) {
-            throw new \Exception('Braintree Exception Authentication Failed');
-        } catch (\Exception $e) {
-            // do nothing
-        }
-    }
-
-    /**
-     * Check if subscription has future payment pending.
-     *
-     * @param  Subscription    $subscription
-     * @return Boolean
-     */
-    public function getCardInformation($email)
-    {
-        // get or create plan
-        $braintreeCustomer = $this->getBraintreeCustomer($email);
-
-        $cards = $braintreeCustomer->paymentMethods;
-
-        return empty($cards) ? null : $cards[0];
-    }
-
-    /**
-     * Get user has card.
-     *
-     * @return string
-     */
-    public function hasCard($email, $autoBillingData)
-    {
-        $card = $this->getCardInformation($email);
-        return $card !== null &&
-            $autoBillingData != null &&
-            isset($autoBillingData->getData()['paymentMethodToken']) && 
-            $card->token == $autoBillingData->getData()['paymentMethodToken'];
-    }
-
-    /**
-     * Get the braintree customer instance for the current user and token.
-     *
-     * @param  SubscriptionParam    $subscriptionParam
-     * @return \Braintree\Customer
-     */
-    protected function getBraintreeCustomer($email)
-    {
-        // Find in gateway server
-        $braintreeCustomers = $this->serviceGateway->customer()->search([
-            \Braintree_CustomerSearch::email()->is($email)
-        ]);
-        
-        if ($braintreeCustomers->maximumCount() == 0) {
-            // create if not exist
-            $result = $this->serviceGateway->customer()->create([
-                'email' => $email,
-            ]);
-            
-            if ($result->success) {
-                $braintreeCustomer = $result->customer;
-            } else {
-                foreach ($result->errors->deepAll() as $error) {
-                    throw new \Exception($error->code . ": " . $error->message . "\n");
-                }
-            }
-        } else {
-            $braintreeCustomer = $braintreeCustomers->firstItem();
-        }
-
-
-        return $braintreeCustomer;
-    }
-
-    /**
-     * Update customer card.
-     *
-     * @param  string    $userId
-     * @return Boolean
-     */
-    public function updateCard($email, $nonce)
-    {
-        $braintreeCustomer = $this->getBraintreeCustomer($email);
-        
-        // update card
-        $updateResult = $this->serviceGateway->customer()->update(
-            $braintreeCustomer->id,
-            [
-              'paymentMethodNonce' => $nonce
-            ]
-        );
-    }
-
-    /**
-     * Chareg subscription.
-     *
-     * @param  mixed              $token
-     * @param  SubscriptionParam  $param
-     * @return void
-     */
-    public function doCharge($data)
-    {        
-        $result = $this->serviceGateway->transaction()->sale([
-            'amount' => $data['amount'],
-            'paymentMethodToken' => $data['paymentMethodToken'],
-        ]);
-          
-        if ($result->success) {
-        } else {
-            foreach ($result->errors->deepAll() as $error) {
-                throw new \Exception($error->code . ": " . $error->message . "\n");
-            }
-        }
-    }
-
-    /**
-     * Get checkout url.
-     *
-     * @return string
-     */
-    public function getCheckoutUrl($invoice) : string
-    {
-        return \Acelle\Cashier\Cashier::lr_action("\Acelle\Cashier\Controllers\BraintreeController@checkout", [
-            'invoice_uid' => $invoice->uid,
-        ]);
-    }
-
     public function supportsAutoBilling() : bool
     {
         return true;
@@ -296,9 +101,200 @@ class BraintreePaymentGateway implements PaymentGatewayInterface
      */
     public function getAutoBillingDataUpdateUrl($returnUrl='/') : string
     {
-        return \Acelle\Cashier\Cashier::lr_action("\Acelle\Cashier\Controllers\BraintreeController@autoBillingDataUpdate", [
+        return \Acelle\Cashier\Cashier::lr_action("\Acelle\Cashier\Controllers\PaystackController@autoBillingDataUpdate", [
             'return_url' => $returnUrl,
         ]);
+    }
+
+    /**
+     * Get checkout url.
+     *
+     * @return string
+     */
+    public function getCheckoutUrl($invoice) : string
+    {
+        return \Acelle\Cashier\Cashier::lr_action("\Acelle\Cashier\Controllers\PaystackController@checkout", [
+            'invoice_uid' => $invoice->uid,
+        ]);
+    }
+
+    public function verify(Transaction $transaction) : TransactionResult
+    {
+        throw new \Exception("Payment service {$this->getType()} should not have pending transaction to verify");
+    }
+
+    public function allowManualReviewingOfTransaction() : bool
+    {
+        return false;
+    }
+
+    /**
+     * Check invoice for paying.
+     *
+     * @return void
+    */
+    public function autoCharge($invoice)
+    {
+        $invoice->checkout($this, function($invoice) {
+            $card = $this->getCard($invoice->customer);
+
+            try {
+                // charge invoice
+                $this->doCharge([
+                    'amount' => $invoice->total(),
+                    'currency' => $invoice->getCurrencyCode(),
+                    'description' => trans('messages.pay_invoice', [
+                        'id' => $invoice->uid,
+                    ]),
+                    'email' => $card['email'],
+                    'authorization_code' => $card['authorization_code'],
+                ]);
+
+                return new TransactionResult(TransactionResult::RESULT_DONE);
+            } catch (\Exception $e) {
+                return new TransactionResult(TransactionResult::RESULT_FAILED, $e->getMessage());
+            }
+        });
+    }
+
+    /**
+     * Request PayPal service.
+     *
+     * @return void
+     */
+    private function request($uri, $type = 'GET', $headers = [], $body = '')
+    {
+        $client = new \GuzzleHttp\Client();
+        $uri = 'https://api.paystack.co/' . $uri;
+        $headers = array_merge([
+            'Authorization' => 'Bearer ' . $this->secretKey,
+            'Content-Type' => 'application/json',
+        ], $headers);
+        $response = $client->request($type, $uri, [
+            'headers' => $headers,
+            'body' => is_array($body) ? json_encode($body) : $body,
+        ]);
+        return json_decode($response->getBody(), true);
+    }
+
+    /**
+     * Check if service is valid.
+     *
+     * @return void
+     */
+    public function test()
+    {
+        try {
+            $this->request('transaction/verify/' . 'ffffff', 'GET', []);
+        } catch (\Exception $ex) {
+            if (strpos($ex->getMessage(), 'Invalid key') !== false) {
+                throw new \Exception('Invalid key');
+            }
+        }
+    }
+
+    /**
+     * Verify payment transaction.
+     *
+     * @return void
+     */
+    public function verifyPayment($invoice, $ref)
+    {
+        $result = $this->request('transaction/verify/' . $ref, 'GET', []);
+
+        // transaction failed
+        if (!$result['status']) {
+            throw new \Exception($result['message']);
+        }
+
+        // data failed
+        if (!isset($result['data'])) {
+            throw new \Exception('No data return from service');
+        }
+
+        // data failed
+        if ($result['data']['status'] != 'success') {
+            throw new \Exception($result['data']['message']);
+        }
+
+        // update auto billing data
+        $autoBillingData = new AutoBillingData($this, [
+            'last_transaction' => $result,
+        ]);
+        $invoice->customer->setAutoBillingData($autoBillingData);
+
+        return $result;
+    }
+
+    public function getCard($customer)
+    {
+        $autoBillingData = $customer->getAutoBillingData();
+
+        if ($autoBillingData == null) {
+            return false;
+        }
+
+        $metadata = $autoBillingData->getData();
+
+        // check last transaction
+        if (!isset($metadata['last_transaction']) ||
+            !isset($metadata['last_transaction']['data']) ||
+            !isset($metadata['last_transaction']['data']['authorization']) ||
+            !isset($metadata['last_transaction']['data']['authorization']['authorization_code']) ||
+            !isset($metadata['last_transaction']['data']['customer']) ||
+            !isset($metadata['last_transaction']['data']['customer']['email'])
+        ) {
+            return false;
+        } else {
+            return [
+                'authorization_code' => $metadata['last_transaction']['data']['authorization']['authorization_code'],
+                'email' => $metadata['last_transaction']['data']['customer']['email'],
+                'last4' => $metadata['last_transaction']['data']['authorization']['last4'],
+            ];
+        }
+    }
+
+    /**
+     * Charge customer with subscription.
+     *
+     * @param  Customer                $customer
+     * @return void
+     */
+    public function doCharge($data)
+    {
+        $result = $this->request('transaction/charge_authorization', 'POST', [], [
+            'email' => $data['email'],
+            'amount' => $data['amount'] * 100,
+            'currency' => $data['currency'],
+            'authorization_code' => $data['authorization_code'],
+        ]);
+
+        // transaction failed
+        if (!$result['status']) {
+            throw new \Exception($result['message']);
+        }
+
+        // data failed
+        if (!isset($result['data'])) {
+            throw new \Exception('No data return from service');
+        }
+
+        // data failed
+        if ($result['data']['status'] != 'success') {
+            throw new \Exception($result['data']['message']);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Check currency valid.
+     *
+     * @return string
+     */
+    public function currencyValid($currency)
+    {
+        return in_array($currency, ['GHS', 'NGN', 'USD', 'ZAR']);
     }
 
     public function getMinimumChargeAmount($currency)
@@ -468,7 +464,7 @@ class BraintreePaymentGateway implements PaymentGatewayInterface
         
         if (!isset($minimums[$currency])) {
             // 
-            throw new \Exception('Currency is not supported by Braintree: ' . $currency);
+            throw new \Exception('Currency is not supported by Paystack: ' . $currency);
         }
 
         return $minimums[$currency];

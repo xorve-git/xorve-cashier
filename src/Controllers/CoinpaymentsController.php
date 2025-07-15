@@ -3,12 +3,12 @@
 namespace Acelle\Cashier\Controllers;
 
 use Acelle\Http\Controllers\Controller;
-use Acelle\Cashier\Subscription;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Log as LaravelLog;
-use Acelle\Cashier\Cashier;
-use Acelle\Cashier\SubscriptionTransaction;
-use Acelle\Cashier\SubscriptionLog;
+use Acelle\Cashier\Services\CoinpaymentsPaymentGateway;
+use Acelle\Library\Facades\Billing;
+use Acelle\Model\Setting;
+use Acelle\Model\Invoice;
+use Acelle\Library\TransactionResult;
 
 class CoinpaymentsController extends Controller
 {
@@ -17,18 +17,59 @@ class CoinpaymentsController extends Controller
         \Carbon\Carbon::setToStringFormat('jS \o\f F');
     }
 
-    /**
-     * Get return url.
-     *
-     * @return string
-     **/
-    public function getReturnUrl(Request $request) {
-        $return_url = $request->session()->get('checkout_return_url', url('/'));
-        if (!$return_url) {
-            $return_url = url('/');
+    public function settings(Request $request)
+    {
+        $gateway = $this->getPaymentService();
+
+        if ($request->isMethod('post')) {
+            // make validator
+            $validator = \Validator::make($request->all(), [
+                'merchant_id' => 'required',
+                'public_key' => 'required',
+                'private_key' => 'required',
+                'merchant_id' => 'required',
+                'ipn_secret' => 'required',
+                'receive_currency' => 'required',
+            ]);
+
+            // test service
+            $validator->after(function ($validator) use ($gateway, $request) {
+                try {
+                    $coinpayments = new CoinpaymentsPaymentGateway(
+                        $request->merchant_id, $request->public_key, $request->private_key, $request->ipn_secret, $request->receive_currency);
+                    $coinpayments->test();
+                } catch(\Exception $e) {
+                    $validator->errors()->add('field', 'Can not connect to ' . $gateway->getName() . '. Error: ' . $e->getMessage());
+                }
+            });
+
+            // redirect if fails
+            if ($validator->fails()) {
+                return response()->view('cashier::coinpayments.settings', [
+                    'gateway' => $gateway,
+                    'errors' => $validator->errors(),
+                ], 400);
+            }
+
+            // save settings
+            Setting::set('cashier.coinpayments.merchant_id', $request->merchant_id);
+            Setting::set('cashier.coinpayments.public_key', $request->public_key);
+            Setting::set('cashier.coinpayments.private_key', $request->private_key);
+            Setting::set('cashier.coinpayments.receive_currency', $request->receive_currency);
+            Setting::set('cashier.coinpayments.ipn_secret', $request->ipn_secret);
+
+            // enable if not validate
+            if ($request->enable_gateway) {
+                Billing::enablePaymentGateway($gateway->getType());
+            }
+
+            $request->session()->flash('alert-success', trans('cashier::messages.gateway.updated'));
+            return redirect()->action('Admin\PaymentController@index');
         }
 
-        return $return_url;
+        return view('cashier::coinpayments.settings', [
+            'gateway' => $gateway,
+        ]);
     }
     
     /**
@@ -38,355 +79,63 @@ class CoinpaymentsController extends Controller
      **/
     public function getPaymentService()
     {
-        return Cashier::getPaymentGateway('coinpayments');
+        return Billing::getGateway('coinpayments');
     }
-    
+
     /**
      * Subscription checkout page.
      *
      * @param \Illuminate\Http\Request $request
      *
      * @return \Illuminate\Http\Response
-     **/
-    public function checkout(Request $request, $subscription_id)
+    **/
+    public function checkout(Request $request, $invoice_uid)
     {
         $service = $this->getPaymentService();
-        $subscription = Subscription::findByUid($subscription_id);
+        $invoice = Invoice::findByUid($invoice_uid);
         
         // Save return url
         if ($request->return_url) {
             $request->session()->put('checkout_return_url', $request->return_url);
         }
-        
-        // if subscription is active
-        if ($subscription->isActive()) {
-            return redirect()->away($this->getReturnUrl($request));
+
+        // already paid
+        if ($invoice->isPaid()) {
+            return redirect()->away(Billing::getReturnUrl());;
         }
-        
-        $service->sync($subscription);
-        
-        return view('cashier::coinpayments.checkout', [
-            'gatewayService' => $service,
-            'subscription' => $subscription,
-            'return_url' => $request->session()->get('checkout_return_url'),
-        ]);
-    }
-    
-    /**
-     * Subscription charge.
-     *
-     * @param \Illuminate\Http\Request $request
-     *
-     * @return \Illuminate\Http\Response
-     **/
-    public function charge(Request $request, $subscription_id)
-    {
-        // subscription and service
-        $subscription = Subscription::findByUid($subscription_id);
-        $gatewayService = $this->getPaymentService();
+
+        // exceptions
+        if (!$invoice->isNew()) {
+            throw new \Exception('Invoice is not new');
+        }
+
+        // free plan. No charge
+        if ($invoice->total() == 0) {
+            $invoice->checkout($service, function($invoice) {
+                return new TransactionResult(TransactionResult::RESULT_DONE);
+            });
+
+            return redirect()->away(Billing::getReturnUrl());;
+        }
 
         if ($request->isMethod('post')) {
-            // add transaction
-            $transaction = $subscription->addTransaction(SubscriptionTransaction::TYPE_SUBSCRIBE, [
-                'ends_at' => $subscription->ends_at,
-                'current_period_ends_at' => $subscription->current_period_ends_at,
-                'status' => SubscriptionTransaction::STATUS_PENDING,
-                'title' => trans('cashier::messages.transaction.subscribed_to_plan', [
-                    'plan' => $subscription->plan->getBillableName(),
-                ]),
-                'amount' => $subscription->plan->getBillableFormattedPrice()
+            $service->charge($invoice);
+
+            return redirect()->away(Billing::getReturnUrl());;
+        }
+
+        if ($service->getData($invoice) !== null && isset($service->getData($invoice)['txn_id'])) {
+            $service->checkPay($invoice);
+
+            return view('cashier::coinpayments.pending', [
+                'service' => $service,
+                'invoice' => $invoice,
             ]);
-            
-            // add remote transaction
-            $result = $gatewayService->charge($subscription, [
-                'id' => $transaction->uid,
-                'amount' => $subscription->plan->getBillableAmount(),
-                'desc' => trans('cashier::messages.coinpayments.subscribe_to_plan', [
-                    'plan' => $subscription->plan->getBillableName(),
-                ]),                
+        } else {
+            return view('cashier::coinpayments.charging', [
+                'service' => $service,
+                'invoice' => $invoice,
             ]);
-
-            // update remote data
-            $transaction->updateMetadata([
-                'txn_id' => $result["txn_id"],
-                'checkout_url' => $result["checkout_url"],
-                'status_url' => $result["status_url"],
-                'qrcode_url' => $result["qrcode_url"],
-            ]);
-
-            // set subscription is pending
-            $subscription->setPending();
-
-            return redirect()->away($result['checkout_url']);
         }
-
-        return view('cashier::coinpayments.charge', [
-            'subscription' => $subscription,
-            'gatewayService' => $gatewayService,
-        ]);
-    }
-    
-    /**
-     * Subscription pending page.
-     *
-     * @param \Illuminate\Http\Request $request
-     *
-     * @return \Illuminate\Http\Response
-     **/
-    public function pending(Request $request, $subscription_id)
-    {
-        $service = $this->getPaymentService();
-        $subscription = Subscription::findByUid($subscription_id);
-        $transaction = $service->getInitTransaction($subscription);
-
-        // get remote info
-        $service->updateTransactionRemoteInfo($transaction);
-        
-        if (!$subscription->isPending()) {
-            return redirect()->away($this->getReturnUrl($request));
-        }
-        
-        return view('cashier::coinpayments.pending', [
-            'gatewayService' => $service,
-            'subscription' => $subscription,
-            'transaction' => $transaction,
-            'return_url' => $this->getReturnUrl($request),
-        ]);
-    }
-
-    /**
-     * Subscription pending page.
-     *
-     * @param \Illuminate\Http\Request $request
-     *
-     * @return \Illuminate\Http\Response
-     **/
-    public function transactionPending(Request $request, $subscription_id)
-    {
-        $service = $this->getPaymentService();
-        $subscription = Subscription::findByUid($subscription_id);
-        $transaction = $service->getLastTransaction($subscription);
-
-        // get remote info
-        $service->updateTransactionRemoteInfo($transaction);
-        
-        if (!$service->hasPending($subscription)) {
-            return redirect()->away($this->getReturnUrl($request));
-        }
-        
-        return view('cashier::coinpayments.transactionPending', [
-            'gatewayService' => $service,
-            'subscription' => $subscription,
-            'transaction' => $transaction,
-            'return_url' => $this->getReturnUrl($request),
-        ]);
-    }
-    
-    /**
-     * Renew subscription.
-     *
-     * @param \Illuminate\Http\Request $request
-     *
-     * @return \Illuminate\Http\Response
-     **/
-    public function renew(Request $request, $subscription_id)
-    {
-        // Get current customer
-        $subscription = Subscription::findByUid($subscription_id);
-        $service = $this->getPaymentService();
-        
-        // Save return url
-        if ($request->return_url) {
-            $request->session()->put('checkout_return_url', $request->return_url);
-        }
-        
-        // make sure status is not pending
-        if ($service->hasPending($subscription)) {
-            return redirect()->away($request->return_url);
-        }
-        
-        if ($request->isMethod('post')) {
-            // add transaction
-            $transaction = $subscription->addTransaction(SubscriptionTransaction::TYPE_RENEW, [
-                'ends_at' => $subscription->nextPeriod(),
-                'current_period_ends_at' => $subscription->nextPeriod(),
-                'status' => SubscriptionTransaction::STATUS_PENDING,
-                'title' => trans('cashier::messages.transaction.renew_plan', [
-                    'plan' => $subscription->plan->getBillableName(),
-                ]),
-                'amount' => $subscription->plan->getBillableFormattedPrice(),
-            ]);
-
-            if ($subscription->plan->getBillableAmount() > 0) {
-                // add remote transaction
-                $result = $service->charge($subscription, [
-                    'id' => $transaction->uid,
-                    'amount' => $subscription->plan->getBillableAmount(),
-                    'desc' => trans('cashier::messages.transaction.renew_plan', [
-                        'plan' => $subscription->plan->getBillableName(),
-                    ]),                
-                ]);
-
-                // update remote data
-                $transaction->updateMetadata([
-                    'txn_id' => $result["txn_id"],
-                    'checkout_url' => $result["checkout_url"],
-                    'status_url' => $result["status_url"],
-                    'qrcode_url' => $result["qrcode_url"],
-                ]);
-
-                // add log
-                $subscription->addLog(SubscriptionLog::TYPE_RENEW, [
-                    'plan' => $subscription->plan->getBillableName(),
-                    'price' => $subscription->plan->getBillableFormattedPrice(),
-                ]);
-            } elseif ($subscription->plan->getBillableAmount() == 0) {
-                $service->approvePending($subscription);
-                return redirect()->away($this->getReturnUrl($request));
-
-                // add log
-                $subscription->addLog(SubscriptionLog::TYPE_RENEWED, [
-                    'plan' => $subscription->plan->getBillableName(),
-                    'price' => $subscription->plan->getBillableFormattedPrice(),
-                ]);
-            }
-
-            return redirect()->away($result['checkout_url']);
-        }
-        
-        return view('cashier::coinpayments.renew', [
-            'service' => $service,
-            'subscription' => $subscription,
-            'return_url' => $request->return_url,
-        ]);
-    }
-    
-    /**
-     * Renew subscription.
-     *
-     * @param \Illuminate\Http\Request $request
-     *
-     * @return \Illuminate\Http\Response
-     **/
-    public function changePlan(Request $request, $subscription_id)
-    {
-        // Get current customer
-        $subscription = Subscription::findByUid($subscription_id);
-        $service = $this->getPaymentService();
-        
-        // @todo dependency injection
-        $plan = \Acelle\Model\Plan::findByUid($request->plan_id);        
-        
-        // Save return url
-        if ($request->return_url) {
-            $request->session()->put('checkout_return_url', $request->return_url);
-        }
-        
-        // check if status is not pending
-        if ($service->hasPending($subscription)) {
-            return redirect()->away($request->return_url);
-        }
-
-        // calc plan before change
-        try {
-            $result = Cashier::calcChangePlan($subscription, $plan);
-        } catch (\Exception $e) {
-            $request->session()->flash('alert-error', 'Can not change plan: ' . $e->getMessage());
-            return redirect()->away($request->return_url);
-        }
-        $plan->price = $result['amount'];
-        if ($request->isMethod('post')) {
-            // add transaction
-            $transaction = $subscription->addTransaction(SubscriptionTransaction::TYPE_PLAN_CHANGE, [
-                'ends_at' => $result['endsAt'],
-                'current_period_ends_at' => $result['endsAt'],
-                'status' => SubscriptionTransaction::STATUS_PENDING,
-                'title' => trans('cashier::messages.transaction.change_plan', [
-                    'plan' => $plan->getBillableName(),
-                ]),
-                'amount' => $plan->getBillableFormattedPrice(),
-            ]);
-
-            // save new plan uid
-            $data = $transaction->getMetadata();
-            $data['plan_id'] = $plan->getBillableId();
-            $transaction->updateMetadata($data);
-
-            if ($result['amount'] > 0) {
-                // add remote transaction
-                $result = $service->charge($subscription, [
-                    'id' => $transaction->uid,
-                    'amount' => $result['amount'],
-                    'desc' => trans('cashier::messages.transaction.change_plan', [
-                        'plan' => $plan->getBillableName(),
-                    ]),                
-                ]);
-
-                // update remote data
-                $transaction->updateMetadata([
-                    'txn_id' => $result["txn_id"],
-                    'checkout_url' => $result["checkout_url"],
-                    'status_url' => $result["status_url"],
-                    'qrcode_url' => $result["qrcode_url"],
-                ]);
-
-                // add log
-                $subscription->addLog(SubscriptionLog::TYPE_PLAN_CHANGE, [
-                    'old_plan' => $subscription->plan->getBillableName(),
-                    'plan' => $plan->getBillableName(),
-                    'price' => $plan->getBillableFormattedPrice(),
-                ]);
-            } elseif (round($result['amount']) == 0) {
-                $service->approvePending($subscription);
-
-                // add log
-                $subscription->addLog(SubscriptionLog::TYPE_PLAN_CHANGED, [
-                    'old_plan' => $subscription->plan->getBillableName(),
-                    'plan' => $plan->getBillableName(),
-                    'price' => $plan->getBillableFormattedPrice(),
-                ]);
-
-                return redirect()->away($this->getReturnUrl($request));
-            }
-
-            return redirect()->away($result['checkout_url']);
-        }
-        
-        
-        $plan->price = $result['amount'];
-        
-        return view('cashier::coinpayments.change_plan', [
-            'service' => $service,
-            'subscription' => $subscription,
-            'newPlan' => $plan,
-            'return_url' => $request->return_url,
-            'nextPeriodDay' => $result['endsAt'],
-            'amount' => $plan->getBillableFormattedPrice(),
-        ]);
-    }
-    
-    /**
-     * Cancel new subscription.
-     *
-     * @param \Illuminate\Http\Request $request
-     *
-     * @return \Illuminate\Http\Response
-     */
-    public function cancelNow(Request $request, $subscription_id)
-    {
-        $subscription = Subscription::findByUid($subscription_id);
-        $service = $this->getPaymentService();
-
-        if ($subscription->isPending()) {
-            $subscription->setEnded();
-        }
-
-        $return_url = $request->session()->get('checkout_return_url', url('/'));
-        if (!$return_url) {
-            $return_url = url('/');
-        }
-
-        // Redirect to my subscription page
-        return redirect()->away($return_url);
     }
 }

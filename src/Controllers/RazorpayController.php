@@ -4,13 +4,13 @@ namespace Acelle\Cashier\Controllers;
 
 use Acelle\Http\Controllers\Controller;
 use Illuminate\Http\Request;
-use Acelle\Cashier\Services\PaypalPaymentGateway;
 use Acelle\Library\Facades\Billing;
 use Acelle\Model\Setting;
 use Acelle\Model\Invoice;
 use Acelle\Library\TransactionResult;
+use Acelle\Cashier\Services\RazorpayPaymentGateway;
 
-class PaypalController extends Controller
+class RazorpayController extends Controller
 {
     public function __construct()
     {
@@ -24,16 +24,15 @@ class PaypalController extends Controller
         if ($request->isMethod('post')) {
             // make validator
             $validator = \Validator::make($request->all(), [
-                'environment' => 'required',
-                'client_id' => 'required',
-                'secret' => 'required',
+                'key_id' => 'required',
+                'key_secret' => 'required',
             ]);
 
             // test service
             $validator->after(function ($validator) use ($gateway, $request) {
                 try {
-                    $paypal = new PaypalPaymentGateway($request->environment, $request->client_id, $request->secret);
-                    $paypal->test();
+                    $razorpay = new RazorpayPaymentGateway($request->key_id, $request->key_secret);
+                    $razorpay->test();
                 } catch(\Exception $e) {
                     $validator->errors()->add('field', 'Can not connect to ' . $gateway->getName() . '. Error: ' . $e->getMessage());
                 }
@@ -41,16 +40,15 @@ class PaypalController extends Controller
 
             // redirect if fails
             if ($validator->fails()) {
-                return response()->view('cashier::paypal.settings', [
+                return response()->view('cashier::razorpay.settings', [
                     'gateway' => $gateway,
                     'errors' => $validator->errors(),
                 ], 400);
             }
 
             // save settings
-            Setting::set('cashier.paypal.environment', $request->environment);
-            Setting::set('cashier.paypal.client_id', $request->client_id);
-            Setting::set('cashier.paypal.secret', $request->secret);
+            Setting::set('cashier.razorpay.key_id', $request->key_id);
+            Setting::set('cashier.razorpay.key_secret', $request->key_secret);
 
             // enable if not validate
             if ($request->enable_gateway) {
@@ -61,7 +59,7 @@ class PaypalController extends Controller
             return redirect()->action('Admin\PaymentController@index');
         }
 
-        return view('cashier::paypal.settings', [
+        return view('cashier::razorpay.settings', [
             'gateway' => $gateway,
         ]);
     }
@@ -73,7 +71,7 @@ class PaypalController extends Controller
      **/
     public function getPaymentService()
     {
-        return Billing::getGateway('paypal');
+        return Billing::getGateway('razorpay');
     }
 
     /**
@@ -108,17 +106,31 @@ class PaypalController extends Controller
         }
 
         if ($request->isMethod('post')) {
-            $result = $service->charge($invoice, [
-                'orderID' => $request->orderID,
-            ]);
+            try {
+                $service->charge($invoice, $request);
+            } catch (\Exception $e) {    
+                $request->session()->flash('alert-error', $e->getMessage());
+                return redirect()->away(Billing::getReturnUrl());;
+            }
 
-            // return back
+            // Redirect to my subscription page
             return redirect()->away(Billing::getReturnUrl());;
         }
 
-        return view('cashier::paypal.checkout', [
+        // create order
+        try {
+            $order = $service->createRazorpayOrder($invoice);
+            $customer = $service->getRazorpayCustomer($invoice);
+        } catch (\Exception $e) {
+            $request->session()->flash('alert-error', $e->getMessage());
+            return redirect()->away(Billing::getReturnUrl());;
+        }
+
+        return view('cashier::razorpay.checkout', [
             'invoice' => $invoice,
             'service' => $service,
+            'order' => $order,
+            'customer' => $customer,
         ]);
     }
 }

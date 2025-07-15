@@ -3,22 +3,69 @@
 namespace Acelle\Cashier\Controllers;
 
 use Acelle\Http\Controllers\Controller;
-use Acelle\Cashier\Subscription;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Log as LaravelLog;
-use Acelle\Cashier\Cashier;
-use Acelle\Cashier\SubscriptionTransaction;
-use Acelle\Cashier\SubscriptionLog;
+use Acelle\Cashier\Services\StripePaymentGateway;
+use Acelle\Library\Facades\Billing;
+use Acelle\Model\Setting;
+use Acelle\Model\Invoice;
+use Acelle\Library\TransactionResult;
+use Acelle\Library\AutoBillingData;
+
 
 class StripeController extends Controller
 {
-    public function getReturnUrl(Request $request) {
-        $return_url = $request->session()->get('checkout_return_url', url('/'));
-        if (!$return_url) {
-            $return_url = url('/');
+    public function settings(Request $request)
+    {
+        $gateway = Billing::getGateway('stripe');
+
+        if ($request->isMethod('post')) {
+            // make validator
+            $validator = \Validator::make($request->all(), [
+                'secret_key' => 'required',
+                'publishable_key' => 'required',
+            ]);
+
+            // test service
+            $validator->after(function ($validator) use ($gateway, $request) {
+                try {
+                    $stripe = new StripePaymentGateway($request->publishable_key, $request->secret_key);
+                    $stripe->test();
+                } catch(\Exception $e) {
+                    $validator->errors()->add('field', 'Can not connect to ' . $gateway->getName() . '. Error: ' . $e->getMessage());
+                }
+            });
+
+            // redirect if fails
+            if ($validator->fails()) {
+                return response()->view('cashier::stripe.settings', [
+                    'gateway' => $gateway,
+                    'errors' => $validator->errors(),
+                ], 400);
+            }
+
+            // save settings
+            Setting::set('cashier.stripe.secret_key', $request->secret_key);
+            Setting::set('cashier.stripe.publishable_key', $request->publishable_key);
+
+            // enable if not validate
+            if ($request->enable_gateway) {
+                Billing::enablePaymentGateway($gateway->getType());
+            }
+
+            $request->session()->flash('alert-success', trans('cashier::messages.gateway.updated'));
+            return redirect()->action('Admin\PaymentController@index');
         }
 
-        return $return_url;
+        return view('cashier::stripe.settings', [
+            'gateway' => $gateway,
+        ]);
+    }
+
+    public function getCheckoutUrl($invoice)
+    {
+        return action("\Acelle\Cashier\Controllers\StripeController@checkout", [
+            'invoice_uid' => $invoice->uid,
+        ]);
     }
 
     /**
@@ -28,7 +75,7 @@ class StripeController extends Controller
      **/
     public function getPaymentService()
     {
-        return Cashier::getPaymentGateway('stripe');
+        return Billing::getGateway('stripe');
     }
     
     /**
@@ -38,312 +85,68 @@ class StripeController extends Controller
      *
      * @return \Illuminate\Http\Response
      **/
-    public function checkout(Request $request, $subscription_id)
+    public function checkout(Request $request, $invoice_uid)
     {
-        $subscription = Subscription::findByUid($subscription_id);
-        
-        // save return url
-        $request->session()->put('checkout_return_url', $request->return_url);
+        $service = $this->getPaymentService();
+        $invoice = Invoice::findByUid($invoice_uid);
+        $customer = $invoice->customer;
 
-        // if free plan
-        if ($subscription->plan->getBillableAmount() == 0) {
-            // charged successfully. Set subscription to active
-            $subscription->start();
-
-            // add transaction
-            $subscription->addTransaction(SubscriptionTransaction::TYPE_SUBSCRIBE, [
-                'ends_at' => $subscription->ends_at,
-                'current_period_ends_at' => $subscription->current_period_ends_at,
-                'status' => SubscriptionTransaction::STATUS_SUCCESS,
-                'title' => trans('cashier::messages.transaction.subscribed_to_plan', [
-                    'plan' => $subscription->plan->getBillableName(),
-                ]),
-                'amount' => $subscription->plan->getBillableFormattedPrice()
-            ]);
-
-            // add log
-            $subscription->addLog(SubscriptionLog::TYPE_PAID, [
-                'plan' => $subscription->plan->getBillableName(),
-                'price' => $subscription->plan->getBillableFormattedPrice(),
-            ]);
-
-            // Redirect to my subscription page
-            return redirect()->away($this->getReturnUrl($request));
+        // exceptions
+        if (!$invoice->isNew()) {
+            throw new \Exception('Invoice is not new');
         }
-        
-        // for demo site only
-        if (isSiteDemo()) {
-            if ($subscription->plan->price == 0) {
-                $subscription->delete();
 
-                $request->session()->flash('alert-error', trans('messages.operation_not_allowed_in_demo'));
-                return redirect()->action('\Acelle\Http\Controllers\AccountSubscriptionController@selectPlan');
+        // free plan. No charge
+        if ($invoice->total() == 0) {
+            $invoice->checkout($service, function($invoice) {
+                return new TransactionResult(TransactionResult::RESULT_DONE);
+            });
+
+            return redirect()->away(Billing::getReturnUrl());;
+        }
+
+        if ($request->isMethod('post')) {
+            // Use current card
+            if ($request->current_card) {
+                $service->autoCharge($invoice);
+
+                return redirect()->away(Billing::getReturnUrl());;
+
+            // Use new card. User already paid before, just return done.
+            } else {
+                $stripeCustomer = $service->getStripeCustomer($customer->uid);
+
+                // update auto billing data
+                $autoBillingData = new AutoBillingData($service, [
+                    'payment_method_id' => $request->payment_method_id,
+                    'customer_id' => $stripeCustomer->id,
+                ]);
+                $customer->setAutoBillingData($autoBillingData);
+
+                // invoice checkout
+                $invoice->checkout($service, function($invoice) {
+                    return new TransactionResult(TransactionResult::RESULT_DONE);
+                });
             }
-
-            $service = $this->getPaymentService();
-            \Stripe\Stripe::setApiVersion("2017-04-06");
-            
-            $session = \Stripe\Checkout\Session::create([
-                'payment_method_types' => ['card'],
-                'line_items' => [[
-                  'name' => $subscription->plan->getBillableName(),
-                  'description' => \Acelle\Model\Setting::get('site_name'),
-                  'images' => ['https://b.imge.to/2019/10/05/vE0yqs.png'],
-                  'amount' => $subscription->plan->stripePrice(),
-                  'currency' => $subscription->plan->getBillableCurrency(),
-                  'quantity' => 1,
-                ]],
-                'success_url' => url('/'),
-                'cancel_url' => action('\Acelle\Http\Controllers\AccountSubscriptionController@index'),
-            ]);
-            
-            $subscription->delete();
-
-            return view('cashier::stripe.checkout_demo', [
-                'service' => $service,
-                'session' => $session,
-            ]);
         }
 
         return view('cashier::stripe.checkout', [
-            'service' => $this->getPaymentService(),
-            'subscription' => $subscription,
-        ]);
-    }
-    
-    /**
-     * Subscribe with card information.
-     *
-     * @param \Illuminate\Http\Request $request
-     *
-     * @return \Illuminate\Http\Response
-     **/
-    public function updateCard(Request $request, $subscription_id)
-    {
-        // subscription and service
-        $subscription = Subscription::findByUid($subscription_id);
-        $service = $this->getPaymentService();
-        
-        // update card
-        $service->billableUserUpdateCard($subscription->user, $request->all());
-
-        return redirect()->away($request->redirect);
-    }
-    
-    /**
-     * Subscription charge.
-     *
-     * @param \Illuminate\Http\Request $request
-     *
-     * @return \Illuminate\Http\Response
-     **/
-    public function charge(Request $request, $subscription_id)
-    {
-        // subscription and service
-        $subscription = Subscription::findByUid($subscription_id);
-        $service = $this->getPaymentService();
-
-        if ($request->isMethod('post')) {
-            // charge customer
-            $service->charge($subscription, [
-                'amount' => $subscription->plan->getBillableAmount(),
-                'currency' => $subscription->plan->getBillableCurrency(),
-                'description' => trans('cashier::messages.transaction.subscribed_to_plan', [
-                    'plan' => $subscription->plan->getBillableName(),
-                ]),
-            ]);
-
-            // charged successfully. Set subscription to active
-            $subscription->start();
-
-            // add transaction
-            $subscription->addTransaction(SubscriptionTransaction::TYPE_SUBSCRIBE, [
-                'ends_at' => $subscription->ends_at,
-                'current_period_ends_at' => $subscription->current_period_ends_at,
-                'status' => SubscriptionTransaction::STATUS_SUCCESS,
-                'title' => trans('cashier::messages.transaction.subscribed_to_plan', [
-                    'plan' => $subscription->plan->getBillableName(),
-                ]),
-                'amount' => $subscription->plan->getBillableFormattedPrice()
-            ]);
-
-            // add log
-            $subscription->addLog(SubscriptionLog::TYPE_PAID, [
-                'plan' => $subscription->plan->getBillableName(),
-                'price' => $subscription->plan->getBillableFormattedPrice(),
-            ]);
-            sleep(1);
-            // add log
-            $subscription->addLog(SubscriptionLog::TYPE_SUBSCRIBED, [
-                'plan' => $subscription->plan->getBillableName(),
-                'price' => $subscription->plan->getBillableFormattedPrice(),
-            ]);
-
-
-            // Redirect to my subscription page
-            return redirect()->away($this->getReturnUrl($request));
-        }
-
-        return view('cashier::stripe.charge', [
-            'subscription' => $subscription,
-        ]);
-    }
-    
-    /**
-     * Change subscription plan.
-     *
-     * @param \Illuminate\Http\Request $request
-     *
-     * @return \Illuminate\Http\Response
-     **/
-    public function changePlan(Request $request, $subscription_id)
-    {
-        // Get current customer
-        $subscription = Subscription::findByUid($subscription_id);
-        $service = $this->getPaymentService();
-        // @todo dependency injection 
-        $newPlan = \Acelle\Model\Plan::findByUid($request->plan_id);
-        
-        // calc when change plan
-        $result = Cashier::calcChangePlan($subscription, $newPlan);
-        
-        if ($request->isMethod('post')) {         
-            // charge customer
-            if ($result['amount'] > 0) {
-                // charge customer
-                $service->charge($subscription, [
-                    'amount' => $result['amount'],
-                    'currency' => $newPlan->getBillableCurrency(),
-                    'description' => trans('cashier::messages.transaction.change_plan', [
-                        'plan' => $newPlan->getBillableName(),
-                    ]),
-                ]);
-            }
-            
-            // change plan
-            $subscription->changePlan($newPlan);
-            
-            // add transaction
-            $subscription->addTransaction(SubscriptionTransaction::TYPE_PLAN_CHANGE, [
-                'ends_at' => $subscription->ends_at,
-                'current_period_ends_at' => $subscription->current_period_ends_at,
-                'status' => SubscriptionTransaction::STATUS_SUCCESS,
-                'title' => trans('cashier::messages.transaction.change_plan', [
-                    'plan' => $newPlan->getBillableName(),
-                ]),
-                'amount' => $newPlan->getBillableFormattedPrice()
-            ]);
-
-            // add log
-            $subscription->addLog(SubscriptionLog::TYPE_PLAN_CHANGED, [
-                'old_plan' => $subscription->plan->getBillableName(),
-                'plan' => $newPlan->getBillableName(),
-                'price' => $newPlan->getBillableFormattedPrice(),
-            ]);
-
-            // Redirect to my subscription page
-            return redirect()->away($this->getReturnUrl($request));
-        }
-        
-        return view('cashier::stripe.change_plan', [
-            'subscription' => $subscription,
-            'return_url' => $this->getReturnUrl($request),
-            'newPlan' => $newPlan,
-            'nextPeriodDay' => $result['endsAt'],
             'service' => $service,
-            'amount' => $result['amount'],
+            'invoice' => $invoice,
+            'paymentMethod' => $service->getPaymentMethod($customer),
+            'clientSecret' => $service->getClientSecret($customer->uid, $invoice),
         ]);
     }
-    
-    /**
-     * Change subscription plan pending page.
-     *
-     * @param \Illuminate\Http\Request $request
-     *
-     * @return \Illuminate\Http\Response
-     **/
-    public function changePlanPending(Request $request, $subscription_id)
-    {
-        // Get current customer
-        $subscription = Subscription::findByUid($subscription_id);
-        $service = $this->getPaymentService();
-        
-        return view('cashier::stripe.change_plan_pending', [
-            'subscription' => $subscription,
-            'plan_id' => $request->plan_id,
-        ]);
-    }
-    
-    /**
-     * Payment redirecting.
-     *
-     * @param \Illuminate\Http\Request $request
-     *
-     * @return \Illuminate\Http\Response
-     **/
-    public function paymentRedirect(Request $request)
-    {
-        return view('cashier::stripe.payment_redirect', [
-            'redirect' => $request->redirect,
-        ]);
-    }
-    
-    /**
-     * Cancel new subscription.
-     *
-     * @param \Illuminate\Http\Request $request
-     *
-     * @return \Illuminate\Http\Response
-     */
-    public function cancelNow(Request $request, $subscription_id)
-    {
-        $subscription = Subscription::findByUid($subscription_id);
-        $service = $this->getPaymentService();
 
-        if ($subscription->isNew()) {
-            $subscription->setEnded();
-        }
+    public function paymentAuth(Request $request, $invoice_uid)
+    {
+        $invoice = Invoice::findByUid($invoice_uid);
 
-        $return_url = $request->session()->get('checkout_return_url', url('/'));
-        if (!$return_url) {
-            $return_url = url('/');
-        }
-
-        // Redirect to my subscription page
-        return redirect()->away($return_url);
+        return redirect()->away($this->getCheckoutUrl($invoice));
     }
 
-    /**
-     * Fix transation.
-     *
-     * @param \Illuminate\Http\Request $request
-     *
-     * @return \Illuminate\Http\Response
-     **/
-    public function fixPayment(Request $request, $subscription_id)
+    public function autoBillingDataUpdate(Request $request)
     {
-        // Get current customer
-        $subscription = Subscription::findByUid($subscription_id);
-        $service = $this->getPaymentService();
-        
-        if ($request->isMethod('post')) {
-            // try to renew again
-            $ok = $service->renew($subscription);
-
-            if ($ok) {
-                // remove last_error
-                $subscription->last_error_type = null;
-                $subscription->save();
-            }
-
-            // Redirect to my subscription page
-            return redirect()->away($this->getReturnUrl($request));
-        }
-        
-        return view('cashier::stripe.fix_payment', [
-            'subscription' => $subscription,
-            'return_url' => $this->getReturnUrl($request),
-            'service' => $service,
-        ]);
+        return redirect()->away(Billing::getReturnUrl());;
     }
 }

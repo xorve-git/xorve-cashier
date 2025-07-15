@@ -4,19 +4,14 @@ namespace Acelle\Cashier\Controllers;
 
 use Acelle\Http\Controllers\Controller;
 use Illuminate\Http\Request;
-use Acelle\Cashier\Services\PaypalPaymentGateway;
+use Acelle\Cashier\Services\PaystackPaymentGateway;
 use Acelle\Library\Facades\Billing;
 use Acelle\Model\Setting;
 use Acelle\Model\Invoice;
 use Acelle\Library\TransactionResult;
 
-class PaypalController extends Controller
+class PaystackController extends Controller
 {
-    public function __construct()
-    {
-        \Carbon\Carbon::setToStringFormat('jS \o\f F');
-    }
-
     public function settings(Request $request)
     {
         $gateway = $this->getPaymentService();
@@ -24,16 +19,15 @@ class PaypalController extends Controller
         if ($request->isMethod('post')) {
             // make validator
             $validator = \Validator::make($request->all(), [
-                'environment' => 'required',
-                'client_id' => 'required',
-                'secret' => 'required',
+                'public_key' => 'required',
+                'secret_key' => 'required',
             ]);
 
             // test service
             $validator->after(function ($validator) use ($gateway, $request) {
                 try {
-                    $paypal = new PaypalPaymentGateway($request->environment, $request->client_id, $request->secret);
-                    $paypal->test();
+                    $paystack = new PaystackPaymentGateway($request->public_key, $request->secret_key);
+                    $paystack->test();
                 } catch(\Exception $e) {
                     $validator->errors()->add('field', 'Can not connect to ' . $gateway->getName() . '. Error: ' . $e->getMessage());
                 }
@@ -41,16 +35,15 @@ class PaypalController extends Controller
 
             // redirect if fails
             if ($validator->fails()) {
-                return response()->view('cashier::paypal.settings', [
+                return response()->view('cashier::paystack.settings', [
                     'gateway' => $gateway,
                     'errors' => $validator->errors(),
                 ], 400);
             }
 
             // save settings
-            Setting::set('cashier.paypal.environment', $request->environment);
-            Setting::set('cashier.paypal.client_id', $request->client_id);
-            Setting::set('cashier.paypal.secret', $request->secret);
+            Setting::set('cashier.paystack.public_key', $request->public_key);
+            Setting::set('cashier.paystack.secret_key', $request->secret_key);
 
             // enable if not validate
             if ($request->enable_gateway) {
@@ -61,7 +54,7 @@ class PaypalController extends Controller
             return redirect()->action('Admin\PaymentController@index');
         }
 
-        return view('cashier::paypal.settings', [
+        return view('cashier::paystack.settings', [
             'gateway' => $gateway,
         ]);
     }
@@ -73,7 +66,7 @@ class PaypalController extends Controller
      **/
     public function getPaymentService()
     {
-        return Billing::getGateway('paypal');
+        return Billing::getGateway('paystack');
     }
 
     /**
@@ -108,17 +101,60 @@ class PaypalController extends Controller
         }
 
         if ($request->isMethod('post')) {
-            $result = $service->charge($invoice, [
-                'orderID' => $request->orderID,
-            ]);
+            try {
+                $invoice->checkout($service, function($invoice) use ($service, $request) {
+                    // check pay
+                    $service->verifyPayment($invoice, $request->reference);
+                    
+                    return new TransactionResult(TransactionResult::RESULT_DONE);
+                });
 
-            // return back
-            return redirect()->away(Billing::getReturnUrl());;
+                return redirect()->away(Billing::getReturnUrl());;
+            } catch (\Exception $e) {
+                // return with error message
+                $request->session()->flash('alert-error', $e->getMessage());
+                return redirect()->away(Billing::getReturnUrl());;
+            }
         }
 
-        return view('cashier::paypal.checkout', [
-            'invoice' => $invoice,
+        return view('cashier::paystack.checkout', [
             'service' => $service,
+            'invoice' => $invoice,
         ]);
+    }
+
+    /**
+     * Subscription checkout page.
+     *
+     * @param \Illuminate\Http\Request $request
+     *
+     * @return \Illuminate\Http\Response
+    **/
+    public function charge(Request $request, $invoice_uid)
+    {
+        $service = $this->getPaymentService();
+        $invoice = Invoice::findByUid($invoice_uid);
+
+        // exceptions
+        if (!$invoice->isNew()) {
+            throw new \Exception('Invoice is not new');
+        }
+        
+        // autopay
+        $service->autoCharge($invoice);
+
+        return redirect()->away(Billing::getReturnUrl());;
+    }
+
+    /**
+     * Fix transation.
+     *
+     * @param \Illuminate\Http\Request $request
+     *
+     * @return \Illuminate\Http\Response
+     **/
+    public function autoBillingDataUpdate(Request $request)
+    {
+        return redirect()->away(Billing::getReturnUrl());;
     }
 }

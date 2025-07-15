@@ -3,6 +3,7 @@
 namespace Acelle\Cashier;
 
 use Illuminate\Support\ServiceProvider;
+use Acelle\Library\Facades\Hook;
 
 class CashierServiceProvider extends ServiceProvider
 {
@@ -13,30 +14,40 @@ class CashierServiceProvider extends ServiceProvider
      */
     public function boot()
     {
-        $this->loadViewsFrom(__DIR__.'/../resources/views', 'cashier');
+        // @deprecated, it is a dependency
+        // Only bootstraping the services if the application is already initialized
+        // if (!isInitiated()) {
+        //     return;
+        // }
 
-        $this->publishes([
-            __DIR__.'/../resources/views' => $this->app->basePath('resources/views/vendor/cashier'),
-        ]);
-        
         // lang
-        $this->loadTranslationsFrom(__DIR__.'/../resources/lang', 'cashier');
-        
+        $this->loadTranslationsFrom(storage_path('app/cashier/lang'), 'cashier');
+
         // routes
         $this->loadRoutesFrom(__DIR__.'/../routes.php');
-        
+
         // view
         $this->loadViewsFrom(__DIR__.'/../resources/views', 'cashier');
-        
+
         // assets
         $this->publishes([
             __DIR__.'/../assets' => public_path('vendor/acelle-cashier'),
         ], 'public');
-        
-        // publish config
-        $this->publishes([
-        __DIR__.'/../config/cashier.php' => config_path('cashier.php'),
-    ]);
+
+        Hook::register('add_translation_file', function() {
+            return [
+                "id" => 'cashier_message',
+                "plugin_name" => "Acelle/Cashier",
+                "file_title" => "Cashier: messages",
+                "translation_folder" => storage_path('app/cashier/lang'),
+                "file_name" => "messages.php",
+                "master_translation_file" => realpath(__DIR__.'/../resources/lang/en/messages.php'),
+                "master_translation_file_by_language" => [
+                    'en' => realpath(__DIR__.'/../resources/lang/en/messages.php'), // optional
+                    'ja' => realpath(__DIR__.'/../resources/lang/ja/messages.php')
+                ]
+            ];
+        });
     }
 
     /**
@@ -46,8 +57,5 @@ class CashierServiceProvider extends ServiceProvider
      */
     public function register()
     {
-        $this->mergeConfigFrom(
-        __DIR__.'/../config/cashier.php', 'cashier'
-    );
     }
 }
