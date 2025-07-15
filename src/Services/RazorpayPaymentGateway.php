@@ -4,10 +4,7 @@ namespace Acelle\Cashier\Services;
 
 use Illuminate\Support\Facades\Log;
 use Acelle\Library\Contracts\PaymentGatewayInterface;
-use Carbon\Carbon;
-use Acelle\Cashier\Cashier;
-use Acelle\Model\Invoice;
-use Acelle\Library\TransactionResult;
+use Acelle\Model\PaymentMethod;
 use Acelle\Model\Transaction;
 
 class RazorpayPaymentGateway implements PaymentGatewayInterface
@@ -30,26 +27,6 @@ class RazorpayPaymentGateway implements PaymentGatewayInterface
         $this->validate();
     }
 
-    public function getName() : string
-    {
-        return trans('cashier::messages.razorpay');
-    }
-
-    public function getType() : string
-    {
-        return self::TYPE;
-    }
-
-    public function getDescription() : string
-    {
-        return trans('cashier::messages.razorpay.description');
-    }
-
-    public function getShortDescription() : string
-    {
-        return trans('cashier::messages.razorpay.short_description');
-    }
-
     public function validate()
     {
         if (!$this->keyId || !$this->keySecret) {
@@ -65,19 +42,15 @@ class RazorpayPaymentGateway implements PaymentGatewayInterface
         return $this->active;
     }
 
-    public function getSettingsUrl() : string
-    {
-        return action("\Acelle\Cashier\Controllers\RazorpayController@settings");
-    }
-
-    public function getCheckoutUrl($invoice) : string
+    public function getCheckoutUrl($invoice, $paymentGatewayId) : string
     {
         return action("\Acelle\Cashier\Controllers\RazorpayController@checkout", [
             'invoice_uid' => $invoice->uid,
+            'payment_gateway_id' => $paymentGatewayId,
         ]);
     }
 
-    public function verify(Transaction $transaction) : TransactionResult
+    public function verify(Transaction $transaction)
     {
         throw new \Exception("Payment service {$this->getType()} should not have pending transaction to verify");
     }
@@ -87,19 +60,9 @@ class RazorpayPaymentGateway implements PaymentGatewayInterface
         return false;
     }
 
-    public function autoCharge($invoice)
+    public function autoCharge($invoice, PaymentMethod $paymentMethod)
     {
         throw new \Exception('Razorpay payment gateway does not support auto charge!');
-    }
-
-    public function getAutoBillingDataUpdateUrl($returnUrl='/') : string
-    {
-        throw new \Exception('
-            Razorpay gateway does not support auto charge.
-            Therefor method getAutoBillingDataUpdateUrl is not supported.
-            Something wrong in your design flow!
-            Check if a gateway supports auto billing by calling $gateway->supportsAutoBilling().
-        ');
     }
 
     public function supportsAutoBilling() : bool
@@ -293,16 +256,16 @@ class RazorpayPaymentGateway implements PaymentGatewayInterface
     */
     public function charge($invoice, $request)
     {
-        $invoice->checkout($this, function($invoice) use ($request) {
-            try {
-                // charge invoice
-                $this->verifyCharge($request);
+        try {
+            // charge invoice
+            $this->verifyCharge($request);
 
-                return new TransactionResult(TransactionResult::RESULT_DONE);
-            } catch (\Exception $e) {
-                return new TransactionResult(TransactionResult::RESULT_FAILED, $e->getMessage());
-            }
-        });
+            // success
+            $invoice->paySuccess($paymentMethod);
+        } catch (\Exception $e) {
+            // failed
+            $invoice->payFailed($paymentMethod, $e->getMessage());
+        }
     }
 
     public function verifyCharge($request)
@@ -316,5 +279,17 @@ class RazorpayPaymentGateway implements PaymentGatewayInterface
     public function getMinimumChargeAmount($currency)
     {
         return 0;
+    }
+
+    // get method title
+    public function getMethodTitle($billingData)
+    {
+        return trans('cashier::messages.offline');
+    }
+
+    // get method info
+    public function getMethodInfo($billingData)
+    {
+        return trans('cashier::messages.offline.description');
     }
 }

@@ -3,10 +3,8 @@
 namespace Acelle\Cashier\Services;
 
 use Acelle\Library\Contracts\PaymentGatewayInterface;
-use Acelle\Cashier\Cashier;
+use Acelle\Model\PaymentMethod;
 use Carbon\Carbon;
-use Acelle\Model\Invoice;
-use Acelle\Library\TransactionResult;
 use Acelle\Model\Transaction;
 
 class BraintreePaymentGateway implements PaymentGatewayInterface
@@ -41,31 +39,6 @@ class BraintreePaymentGateway implements PaymentGatewayInterface
         \Carbon\Carbon::setToStringFormat('jS \o\f F');
     }
 
-    public function getName() : string
-    {
-        return trans('cashier::messages.braintree');
-    }
-
-    public function getType() : string
-    {
-        return self::TYPE;
-    }
-
-    public function getDescription() : string
-    {
-        return trans('cashier::messages.braintree.description');
-    }
-
-    public function getShortDescription() : string
-    {
-        return trans('cashier::messages.braintree.short_description');
-    }
-
-    public function getSettingsUrl() : string
-    {
-        return action("\Acelle\Cashier\Controllers\BraintreeController@settings");
-    }
-
     public function validate()
     {
         if (!$this->environment || !$this->merchantId || !$this->privateKey || !$this->publicKey) {
@@ -80,7 +53,7 @@ class BraintreePaymentGateway implements PaymentGatewayInterface
         return $this->active;
     }
 
-    public function verify(Transaction $transaction) : TransactionResult
+    public function verify(Transaction $transaction)
     {
         throw new \Exception("Payment service {$this->getType()} should not have pending transaction to verify");
     }
@@ -95,38 +68,38 @@ class BraintreePaymentGateway implements PaymentGatewayInterface
      *
      * @return void
      */
-    public function autoCharge($invoice)
+    public function autoCharge($invoice, PaymentMethod $paymentMethod)
     {
-        $invoice->checkout($this, function($invoice) {
-            $autoBillingData = $invoice->customer->getAutoBillingData();
+        // charge invoice
+        $autobillingData = json_decode($paymentMethod->autobilling_data, true);
 
-            try {
-                // charge invoice
-                $this->doCharge([
-                    'paymentMethodToken' => $autoBillingData->getData()['paymentMethodToken'],
-                    'amount' => $invoice->total(),
-                    'currency' => $invoice->getCurrencyCode(),
-                    'description' => trans('messages.pay_invoice', [
-                        'id' => $invoice->uid,
-                    ]),
-                ]);
+        try {
+            // charge invoice
+            $this->doCharge([
+                'paymentMethodToken' => $autobillingData['payment_method_token'],
+                'amount' => $invoice->total(),
+                'currency' => $invoice->getCurrencyCode(),
+                'description' => trans('messages.pay_invoice', [
+                    'id' => $invoice->uid,
+                ]),
+            ]);
 
-                return new TransactionResult(TransactionResult::RESULT_DONE);
-            } catch (\Throwable $e) {
-                $authPaymentLink = action("\Acelle\Cashier\Controllers\BraintreeController@checkout", [
-                    'invoice_uid' => $invoice->uid,
-                ]);
+            // success
+            $invoice->paySuccess($paymentMethod);
+        } catch (\Throwable $e) {
+            $authPaymentLink = action("\Acelle\Cashier\Controllers\BraintreeController@checkout", [
+                'invoice_uid' => $invoice->uid,
+                'payment_gateway_id' => $paymentMethod->paymentGateway->uid,
+            ]);
 
-                return new TransactionResult(
-                    TransactionResult::RESULT_FAILED,
-                    $e->getMessage() . ' ' . trans('cashier::messages.braintree.click_to_auth', [
-                        'link' => $authPaymentLink,
-                    ])
-                );
-                
-                return new TransactionResult(TransactionResult::RESULT_FAILED, $e->getMessage());
-            }
-        });
+            // failed
+            $invoice->payFailed(
+                $paymentMethod,
+                $e->getMessage() . ' ' . trans('cashier::messages.braintree.click_to_auth', [
+                    'link' => $authPaymentLink,
+                ])
+            );
+        }
     }
 
     public function getEnvironment()
@@ -181,20 +154,6 @@ class BraintreePaymentGateway implements PaymentGatewayInterface
         $cards = $braintreeCustomer->paymentMethods;
 
         return empty($cards) ? null : $cards[0];
-    }
-
-    /**
-     * Get user has card.
-     *
-     * @return string
-     */
-    public function hasCard($email, $autoBillingData)
-    {
-        $card = $this->getCardInformation($email);
-        return $card !== null &&
-            $autoBillingData != null &&
-            isset($autoBillingData->getData()['paymentMethodToken']) && 
-            $card->token == $autoBillingData->getData()['paymentMethodToken'];
     }
 
     /**
@@ -277,28 +236,17 @@ class BraintreePaymentGateway implements PaymentGatewayInterface
      *
      * @return string
      */
-    public function getCheckoutUrl($invoice) : string
+    public function getCheckoutUrl($invoice, $paymentGatewayId) : string
     {
         return \Acelle\Cashier\Cashier::lr_action("\Acelle\Cashier\Controllers\BraintreeController@checkout", [
             'invoice_uid' => $invoice->uid,
+            'payment_gateway_id' => $paymentGatewayId,
         ]);
     }
 
     public function supportsAutoBilling() : bool
     {
         return true;
-    }
-
-    /**
-     * Get connect url.
-     *
-     * @return string
-     */
-    public function getAutoBillingDataUpdateUrl($returnUrl='/') : string
-    {
-        return \Acelle\Cashier\Cashier::lr_action("\Acelle\Cashier\Controllers\BraintreeController@autoBillingDataUpdate", [
-            'return_url' => $returnUrl,
-        ]);
     }
 
     public function getMinimumChargeAmount($currency)
@@ -472,5 +420,17 @@ class BraintreePaymentGateway implements PaymentGatewayInterface
         }
 
         return $minimums[$currency];
+    }
+
+    // get method title
+    public function getMethodTitle($billingData)
+    {
+        return $billingData['card_type'] ?? 'Unknown';
+    }
+
+    // get method info
+    public function getMethodInfo($billingData)
+    {
+        return "*** *** *** " . ($billingData['last_4'] ?? 'Unknown');
     }
 }

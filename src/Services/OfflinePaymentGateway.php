@@ -3,8 +3,8 @@
 namespace Acelle\Cashier\Services;
 
 use Acelle\Library\Contracts\PaymentGatewayInterface;
-use Acelle\Library\TransactionResult;
 use Acelle\Model\Transaction;
+use Acelle\Model\PaymentMethod;
 
 class OfflinePaymentGateway implements PaymentGatewayInterface
 {
@@ -18,26 +18,6 @@ class OfflinePaymentGateway implements PaymentGatewayInterface
         $this->paymentInstruction = $paymentInstruction;
 
         $this->validate();
-    }
-
-    public function getName() : string
-    {
-        return trans('cashier::messages.offline');
-    }
-
-    public function getType() : string
-    {
-        return self::TYPE;
-    }
-
-    public function getDescription() : string
-    {
-        return trans('cashier::messages.offline.description');
-    }
-
-    public function getShortDescription() : string
-    {
-        return trans('cashier::messages.offline.short_description');
     }
 
     public function validate()
@@ -54,15 +34,11 @@ class OfflinePaymentGateway implements PaymentGatewayInterface
         return $this->active;
     }
 
-    public function getSettingsUrl() : string
-    {
-        return action("\Acelle\Cashier\Controllers\OfflineController@settings");
-    }
-
-    public function getCheckoutUrl($invoice) : string
+    public function getCheckoutUrl($invoice, $paymentGatewayId) : string
     {
         return action("\Acelle\Cashier\Controllers\OfflineController@checkout", [
             'invoice_uid' => $invoice->uid,
+            'payment_gateway_id' => $paymentGatewayId,
         ]);
     }
 
@@ -71,10 +47,9 @@ class OfflinePaymentGateway implements PaymentGatewayInterface
         return false;
     }
 
-    public function verify(Transaction $transaction) : TransactionResult
+    public function verify(Transaction $transaction)
     {
         // do nothing because offline need admin to approve
-        return new TransactionResult(TransactionResult::RESULT_PENDING);
     }
 
     public function allowManualReviewingOfTransaction() : bool
@@ -82,19 +57,9 @@ class OfflinePaymentGateway implements PaymentGatewayInterface
         return true;
     }
 
-    public function autoCharge($invoice)
+    public function autoCharge($invoice, PaymentMethod $paymentMethod)
     {
         throw new \Exception('Offline payment gateway does not support auto charge!');
-    }
-
-    public function getAutoBillingDataUpdateUrl($returnUrl='/') : string
-    {
-        throw new \Exception('
-            Offline payment gateway does not support auto charge.
-            Therefor method getAutoBillingDataUpdateUrl is not supported.
-            Something wrong in your design flow!
-            Check if a gateway supports auto billing by calling $gateway->supportsAutoBilling().
-        ');
     }
 
     /**
@@ -114,5 +79,17 @@ class OfflinePaymentGateway implements PaymentGatewayInterface
     public function getMinimumChargeAmount($currency)
     {
         return 0;
+    }
+
+    // get method title
+    public function getMethodTitle($billingData)
+    {
+        return trans('cashier::messages.offline');
+    }
+
+    // get method info
+    public function getMethodInfo($billingData)
+    {
+        return trans('cashier::messages.offline.description');
     }
 }
